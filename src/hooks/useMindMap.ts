@@ -1,29 +1,11 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { getOrCreateDefaultMap, saveNodes, updateMapTitle, clearAllData, type MindMap, type MindMapNode } from '@/lib/db';
-import { readMapFromUrl, writeMapToUrl } from '@/lib/urlState';
-
-const NODE_COLORS = [
-  'hsl(217, 91%, 60%)',
-  'hsl(262, 83%, 58%)',
-  'hsl(340, 82%, 52%)',
-  'hsl(142, 71%, 45%)',
-  'hsl(38, 92%, 50%)',
-  'hsl(0, 84%, 60%)',
-];
-
-function getChildColor(depth: number): string {
-  return NODE_COLORS[depth % NODE_COLORS.length];
-}
-
-function getNodeDepth(nodeId: string, nodes: MindMapNode[]): number {
-  let depth = 0;
-  let current = nodes.find(n => n.id === nodeId);
-  while (current?.parentId) {
-    depth++;
-    current = nodes.find(n => n.id === current!.parentId);
-  }
-  return depth;
-}
+import {
+  getOrCreateDefaultMap, saveNodes, updateMapTitle, createMapWithNodes, resetMap,
+  newNodeId, type MindMap, type MindMapNode,
+} from '@/lib/db';
+import { applyLayout, getChildColor, getNodeDepth } from '@/lib/layout';
+import { readMapFromUrl, clearMapFromUrl, buildShareUrl, type SharedMap } from '@/lib/urlState';
+import { serializeMap, mapFileName } from '@/lib/mapFile';
 
 export function useMindMap() {
   const [map, setMap] = useState<MindMap | null>(null);
@@ -38,15 +20,16 @@ export function useMindMap() {
 
   useEffect(() => {
     const shared = readMapFromUrl();
-    getOrCreateDefaultMap().then(({ map, nodes }) => {
-      if (shared && shared.nodes?.length) {
-        setMap({ ...map, title: shared.map?.title ?? map.title });
-        // Re-bind mapId so persistence still works locally
-        setNodes(shared.nodes.map(n => ({ ...n, mapId: map.id! })));
-      } else {
-        setMap(map);
-        setNodes(nodes);
-      }
+    // A shared link lands in a NEW map: opening someone else's link must never
+    // overwrite the map the user already had open.
+    const load = shared?.nodes.length
+      ? createMapWithNodes(shared.title || 'Shared Map', shared.nodes)
+      : getOrCreateDefaultMap();
+
+    load.then(({ map, nodes }) => {
+      if (shared) clearMapFromUrl();
+      setMap(map);
+      setNodes(nodes);
       setLoading(false);
     });
   }, []);
@@ -58,69 +41,11 @@ export function useMindMap() {
     }, 500);
   }, []);
 
-  // Sync to URL hash whenever nodes/title change
-  useEffect(() => {
-    if (loading || !map) return;
-    writeMapToUrl({ map: { title: map.title }, nodes });
-  }, [nodes, map, loading]);
-
-  const applyLayout = useCallback((inputNodes: MindMapNode[]): MindMapNode[] => {
-    const root = inputNodes.find(n => n.parentId === null);
-    if (!root) return inputNodes;
-
-    const HORIZONTAL_GAP = 250;
-    const VERTICAL_GAP = 80;
-
-    const childrenMap = new Map<string, MindMapNode[]>();
-    inputNodes.forEach(n => {
-      if (n.parentId) {
-        const siblings = childrenMap.get(n.parentId) || [];
-        siblings.push(n);
-        childrenMap.set(n.parentId, siblings);
-      }
-    });
-
-    const subtreeHeight = new Map<string, number>();
-    function calcHeight(id: string): number {
-      const node = inputNodes.find(n => n.id === id);
-      const children = (node?.collapsed) ? [] : (childrenMap.get(id) || []);
-      if (children.length === 0) { subtreeHeight.set(id, VERTICAL_GAP); return VERTICAL_GAP; }
-      const h = children.reduce((sum, c) => sum + calcHeight(c.id), 0);
-      subtreeHeight.set(id, h);
-      return h;
-    }
-    calcHeight(root.id);
-
-    const positions = new Map<string, { x: number; y: number }>();
-    positions.set(root.id, { x: 0, y: 0 });
-
-    function layout(id: string, x: number, yStart: number) {
-      const node = inputNodes.find(n => n.id === id);
-      const children = (node?.collapsed) ? [] : (childrenMap.get(id) || []);
-      let yOffset = yStart;
-      children.forEach(child => {
-        const h = subtreeHeight.get(child.id) || VERTICAL_GAP;
-        const cy = yOffset + h / 2;
-        positions.set(child.id, { x, y: cy });
-        layout(child.id, x + HORIZONTAL_GAP, yOffset);
-        yOffset += h;
-      });
-    }
-
-    const totalH = subtreeHeight.get(root.id) || 0;
-    layout(root.id, HORIZONTAL_GAP, -totalH / 2);
-
-    return inputNodes.map(n => {
-      const pos = positions.get(n.id);
-      return pos ? { ...n, ...pos } : n;
-    });
-  }, []);
-
   const updateNodes = useCallback((updatedNodes: MindMapNode[], runLayout = false) => {
     const final = runLayout ? applyLayout(updatedNodes) : updatedNodes;
     setNodes(final);
     if (map?.id) debouncedSave(map.id, final);
-  }, [map, debouncedSave, applyLayout]);
+  }, [map, debouncedSave]);
 
   const rootNode = nodes.find(n => n.parentId === null);
 
@@ -131,7 +56,7 @@ export function useMindMap() {
     const depth = getNodeDepth(parentId, nodes) + 1;
 
     const newNode: MindMapNode = {
-      id: crypto.randomUUID(),
+      id: newNodeId(),
       mapId: map.id,
       parentId,
       text: '',
@@ -153,7 +78,7 @@ export function useMindMap() {
 
     const depth = getNodeDepth(nodeId, nodes);
     const newNode: MindMapNode = {
-      id: crypto.randomUUID(),
+      id: newNodeId(),
       mapId: map.id,
       parentId: node.parentId,
       text: '',
@@ -207,10 +132,26 @@ export function useMindMap() {
     updateNodes(updated, true);
   }, [nodes, updateNodes]);
 
-  const setNodeImage = useCallback((nodeId: string, image: string | undefined) => {
-    const updated = nodes.map(n => n.id === nodeId ? { ...n, image } : n);
-    updateNodes(updated, true);
-  }, [nodes, updateNodes]);
+  /** The full tree, collapsed branches included — never just what is on screen. */
+  const asSharedMap = useCallback((): SharedMap => ({
+    title: map?.title ?? '',
+    nodes,
+  }), [map, nodes]);
+
+  const getShareUrl = useCallback(() => buildShareUrl(asSharedMap()), [asSharedMap]);
+
+  const getMapFile = useCallback(() => {
+    const shared = asSharedMap();
+    return { name: mapFileName(shared.title), contents: serializeMap(shared) };
+  }, [asSharedMap]);
+
+  const importMap = useCallback(async (incoming: SharedMap) => {
+    const created = await createMapWithNodes(incoming.title || 'Imported Map', incoming.nodes);
+    setMap(created.map);
+    setNodes(applyLayout(created.nodes));
+    setSelectedNodeId(created.nodes.find(n => n.parentId === null)?.id ?? null);
+    setEditingNodeId(null);
+  }, []);
 
   // Compute visible nodes (filter out children of collapsed nodes)
   const visibleNodes = (() => {
@@ -231,17 +172,27 @@ export function useMindMap() {
     updateMapTitle(map.id, title);
   }, [map]);
 
+  // Pasting a link into a tab that already has the app open only changes the
+  // hash, so nothing remounts. Pick it up here instead.
+  useEffect(() => {
+    const onHashChange = () => {
+      const shared = readMapFromUrl();
+      if (!shared?.nodes.length) return;
+      clearMapFromUrl();
+      importMap(shared);
+    };
+    window.addEventListener('hashchange', onHashChange);
+    return () => window.removeEventListener('hashchange', onHashChange);
+  }, [importMap]);
+
+  /** Resets the map on screen only. Other maps the user imported stay put. */
   const clearMap = useCallback(async () => {
-    await clearAllData();
-    // Clear URL hash
-    history.replaceState(null, '', `${window.location.pathname}${window.location.search}`);
-    // Recreate default map
-    const { map: newMap, nodes: newNodes } = await getOrCreateDefaultMap();
-    setMap(newMap);
-    setNodes(newNodes);
-    setSelectedNodeId(newNodes[0]?.id ?? null);
+    if (!map?.id) return;
+    const root = await resetMap(map.id);
+    setNodes([root]);
+    setSelectedNodeId(root.id);
     setEditingNodeId(null);
-  }, []);
+  }, [map]);
 
   return {
     map, nodes: visibleNodes, allNodes: nodes, loading,
@@ -251,6 +202,7 @@ export function useMindMap() {
     addChild, addSibling,
     updateNodeText, updateNodePosition,
     deleteNode, setTitle, autoLayout,
-    toggleCollapse, setNodeImage, clearMap,
+    toggleCollapse, clearMap,
+    getShareUrl, getMapFile, importMap,
   };
 }

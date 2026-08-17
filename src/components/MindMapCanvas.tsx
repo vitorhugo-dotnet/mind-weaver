@@ -4,6 +4,7 @@ import { FloatingToolbar } from './FloatingToolbar';
 import { MindMapNodeComponent } from './MindMapNode';
 import { MindMapConnections } from './MindMapConnections';
 import { ExportFab } from './ExportFab';
+import { TopNavBar } from './TopNavBar';
 import { Loader2 } from 'lucide-react';
 import { toPng } from 'html-to-image';
 
@@ -16,7 +17,8 @@ export function MindMapCanvas() {
     addChild, addSibling,
     updateNodeText, updateNodePosition,
     deleteNode, setTitle, autoLayout,
-    toggleCollapse, setNodeImage, clearMap,
+    toggleCollapse, clearMap,
+    getShareUrl, getMapFile, importMap,
   } = useMindMap();
 
   const [pan, setPan] = useState({ x: 0, y: 0 });
@@ -159,7 +161,15 @@ export function MindMapCanvas() {
   const selectedNode = nodes.find(n => n.id === selectedNodeId);
 
   return (
-    <div className="h-screen w-screen overflow-hidden bg-canvas flex flex-col">
+    <div className="h-screen w-screen overflow-hidden bg-canvas flex flex-col pt-12">
+      <TopNavBar
+        title={map?.title ?? ''}
+        onTitleChange={setTitle}
+        onExportPng={handleExport}
+        getShareUrl={getShareUrl}
+        getMapFile={getMapFile}
+        onImport={importMap}
+      />
       <div
         ref={containerRef}
         className="flex-1 relative cursor-grab active:cursor-grabbing"
@@ -227,20 +237,14 @@ export function MindMapCanvas() {
           <FloatingToolbar
             hasSelection={!!selectedNodeId}
             isRoot={selectedNode?.parentId === null}
-            hasImage={!!selectedNode?.image}
             position={toolbarPos}
             onAddChild={() => selectedNodeId && addChild(selectedNodeId)}
             onDelete={() => selectedNodeId && deleteNode(selectedNodeId)}
-            onSetImage={(img) => selectedNodeId && setNodeImage(selectedNodeId, img)}
           />
         );
       })()}
 
-      <ExportFab
-        onExport={handleExport}
-        onClear={clearMap}
-        canClear={allNodes.length > 1}
-      />
+      <ExportFab onClear={clearMap} canClear={allNodes.length > 1} />
     </div>
   );
 }
