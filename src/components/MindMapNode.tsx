@@ -56,14 +56,6 @@ export function MindMapNodeComponent({
         onClick={(e) => { e.stopPropagation(); onSelect(); }}
         onDoubleClick={(e) => { e.stopPropagation(); onStartEdit(); }}
       >
-        {node.image && (
-          <img
-            src={node.image}
-            alt=""
-            className="max-w-[160px] max-h-[120px] object-contain rounded mb-1"
-            draggable={false}
-          />
-        )}
         {isEditing ? (
           <input
             ref={inputRef}
