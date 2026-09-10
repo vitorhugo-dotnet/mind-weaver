@@ -1,10 +1,12 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
 import { useMindMap } from '@/hooks/useMindMap';
-import { TopNavBar } from './TopNavBar';
 import { FloatingToolbar } from './FloatingToolbar';
 import { MindMapNodeComponent } from './MindMapNode';
 import { MindMapConnections } from './MindMapConnections';
+import { ExportFab } from './ExportFab';
+import { TopNavBar } from './TopNavBar';
 import { Loader2 } from 'lucide-react';
+import { toPng } from 'html-to-image';
 
 export function MindMapCanvas() {
   const {
@@ -15,14 +17,51 @@ export function MindMapCanvas() {
     addChild, addSibling,
     updateNodeText, updateNodePosition,
     deleteNode, setTitle, autoLayout,
-    toggleCollapse,
+    toggleCollapse, clearMap,
+    getShareUrl, getMapFile, importMap,
   } = useMindMap();
 
   const [pan, setPan] = useState({ x: 0, y: 0 });
   const [zoom, setZoom] = useState(1);
   const containerRef = useRef<HTMLDivElement>(null);
+  const exportRef = useRef<HTMLDivElement>(null);
   const isPanning = useRef(false);
   const panStart = useRef({ x: 0, y: 0, panX: 0, panY: 0 });
+
+  const handleExport = useCallback(async () => {
+    if (!exportRef.current) return;
+    // Compute bounding box of all nodes for tight crop
+    const padding = 80;
+    const xs = nodes.map(n => n.x);
+    const ys = nodes.map(n => n.y);
+    const minX = Math.min(...xs) - 200;
+    const minY = Math.min(...ys) - 100;
+    const maxX = Math.max(...xs) + 200;
+    const maxY = Math.max(...ys) + 100;
+    const width = Math.max(maxX - minX + padding * 2, 400);
+    const height = Math.max(maxY - minY + padding * 2, 400);
+
+    try {
+      const dataUrl = await toPng(exportRef.current, {
+        backgroundColor: undefined,
+        cacheBust: true,
+        pixelRatio: 2,
+        filter: (el) => !(el instanceof HTMLElement && el.hasAttribute('data-export-ignore')),
+        style: {
+          transform: `translate(${-minX + padding}px, ${-minY + padding}px)`,
+          transformOrigin: '0 0',
+        },
+        width,
+        height,
+      });
+      const link = document.createElement('a');
+      link.download = `${(map?.title || 'mindmap').replace(/[^\w-]+/g, '_')}.png`;
+      link.href = dataUrl;
+      link.click();
+    } catch (err) {
+      console.error('Export failed', err);
+    }
+  }, [nodes, map]);
 
   // Center canvas and auto-layout on first load
   useEffect(() => {
@@ -30,6 +69,7 @@ export function MindMapCanvas() {
       autoLayout();
       const rect = containerRef.current.getBoundingClientRect();
       setPan({ x: rect.width / 2 - rootNode.x, y: rect.height / 2 - rootNode.y });
+      if (!selectedNodeId) setSelectedNodeId(rootNode.id);
     }
   }, [loading, rootNode?.id]);
 
@@ -62,26 +102,53 @@ export function MindMapCanvas() {
   // Keyboard shortcuts
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      if (!selectedNodeId || editingNodeId) return;
+      if (editingNodeId) return;
+      if (!selectedNodeId) return;
+
+      const current = nodes.find(n => n.id === selectedNodeId);
+      if (!current) return;
 
       if (e.key === 'Tab') {
         e.preventDefault();
         addChild(selectedNodeId);
       } else if (e.key === 'Enter') {
         e.preventDefault();
-        addSibling(selectedNodeId);
+        if (current.parentId) {
+          addChild(current.parentId);
+        } else {
+          addChild(current.id);
+        }
       } else if (e.key === 'Delete' || e.key === 'Backspace') {
         e.preventDefault();
         deleteNode(selectedNodeId);
       } else if (e.key === 'F2') {
         e.preventDefault();
         setEditingNodeId(selectedNodeId);
+      } else if (e.key.startsWith('Arrow')) {
+        e.preventDefault();
+        const children = nodes.filter(n => n.parentId === current.id);
+        const siblings = current.parentId
+          ? nodes.filter(n => n.parentId === current.parentId).sort((a, b) => a.y - b.y)
+          : [];
+        const idx = siblings.findIndex(n => n.id === current.id);
+
+        let nextId: string | null = null;
+        if (e.key === 'ArrowRight' && children.length) {
+          nextId = children.sort((a, b) => a.y - b.y)[0].id;
+        } else if (e.key === 'ArrowLeft' && current.parentId) {
+          nextId = current.parentId;
+        } else if (e.key === 'ArrowUp' && idx > 0) {
+          nextId = siblings[idx - 1].id;
+        } else if (e.key === 'ArrowDown' && idx >= 0 && idx < siblings.length - 1) {
+          nextId = siblings[idx + 1].id;
+        }
+        if (nextId) setSelectedNodeId(nextId);
       }
     };
 
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
-  }, [selectedNodeId, editingNodeId, addChild, addSibling, deleteNode, setEditingNodeId]);
+  }, [selectedNodeId, editingNodeId, nodes, addChild, addSibling, deleteNode, setEditingNodeId, setSelectedNodeId]);
 
   if (loading) {
     return (
@@ -94,12 +161,18 @@ export function MindMapCanvas() {
   const selectedNode = nodes.find(n => n.id === selectedNodeId);
 
   return (
-    <div className="h-screen w-screen overflow-hidden bg-canvas flex flex-col">
-      <TopNavBar title={map?.title || ''} onTitleChange={setTitle} />
-
+    <div className="h-screen w-screen overflow-hidden bg-canvas flex flex-col pt-12">
+      <TopNavBar
+        title={map?.title ?? ''}
+        onTitleChange={setTitle}
+        onExportPng={handleExport}
+        getShareUrl={getShareUrl}
+        getMapFile={getMapFile}
+        onImport={importMap}
+      />
       <div
         ref={containerRef}
-        className="flex-1 mt-12 relative cursor-grab active:cursor-grabbing"
+        className="flex-1 relative cursor-grab active:cursor-grabbing"
         onWheel={handleWheel}
         onMouseDown={handleBgMouseDown}
         onMouseMove={handleMouseMove}
@@ -119,36 +192,59 @@ export function MindMapCanvas() {
 
         {/* Zoom/Pan layer */}
         <div
-          className="absolute"
+          ref={exportRef}
           style={{
+            position: 'absolute',
+            top: 0,
+            left: 0,
+            width: 10000,
+            height: 10000,
             transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`,
             transformOrigin: '0 0',
           }}
         >
-          <MindMapConnections nodes={nodes} allNodes={allNodes} onToggleCollapse={toggleCollapse} />
-          {nodes.map(node => (
-            <MindMapNodeComponent
-              key={node.id}
-              node={node}
-              isSelected={node.id === selectedNodeId}
-              isEditing={node.id === editingNodeId}
-              isRoot={node.parentId === null}
-              onSelect={() => setSelectedNodeId(node.id)}
-              onStartEdit={() => { setSelectedNodeId(node.id); setEditingNodeId(node.id); }}
-              onStopEdit={() => setEditingNodeId(null)}
-              onTextChange={(text) => updateNodeText(node.id, text)}
-            />
-          ))}
+          <MindMapConnections nodes={nodes} allNodes={allNodes} />
+          {nodes.map(node => {
+            const childCount = allNodes.filter(n => n.parentId === node.id).length;
+            return (
+              <MindMapNodeComponent
+                key={node.id}
+                node={node}
+                isSelected={node.id === selectedNodeId}
+                isEditing={node.id === editingNodeId}
+                isRoot={node.parentId === null}
+                childCount={childCount}
+                onSelect={() => setSelectedNodeId(node.id)}
+                onStartEdit={() => { setSelectedNodeId(node.id); setEditingNodeId(node.id); }}
+                onStopEdit={() => setEditingNodeId(null)}
+                onTextChange={(text) => updateNodeText(node.id, text)}
+                onToggleCollapse={() => toggleCollapse(node.id)}
+              />
+            );
+          })}
         </div>
       </div>
 
-      <FloatingToolbar
-        hasSelection={!!selectedNodeId}
-        isRoot={selectedNode?.parentId === null}
-        onAddChild={() => selectedNodeId && addChild(selectedNodeId)}
-        onDelete={() => selectedNodeId && deleteNode(selectedNodeId)}
-        onAutoLayout={autoLayout}
-      />
+      {(() => {
+        const containerRect = containerRef.current?.getBoundingClientRect();
+        const toolbarPos = selectedNode && containerRect
+          ? {
+              x: containerRect.left + pan.x + selectedNode.x * zoom,
+              y: containerRect.top + pan.y + (selectedNode.y - 20) * zoom,
+            }
+          : null;
+        return (
+          <FloatingToolbar
+            hasSelection={!!selectedNodeId}
+            isRoot={selectedNode?.parentId === null}
+            position={toolbarPos}
+            onAddChild={() => selectedNodeId && addChild(selectedNodeId)}
+            onDelete={() => selectedNodeId && deleteNode(selectedNodeId)}
+          />
+        );
+      })()}
+
+      <ExportFab onClear={clearMap} canClear={allNodes.length > 1} />
     </div>
   );
 }
